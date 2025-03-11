@@ -1,0 +1,56 @@
+name: PR Review Deployment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Build Docker Image
+        run: docker build -t pr-preview-${{ github.event.pull_request.number }} .
+      - name: Push Image to AWS ECR
+        run:
+          aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin <aws_account_id>.dkr.ecr.us-east-2.amazonaws.com
+          docker tag pr-preview-${{ github.event.pull_request.number }} <aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/pr-preview:${{ github.event.pull_request.number }}
+          docker push <aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/pr-preview:${{ github.event.pull_request.number }}
+
+      - name: Deploy a New ECS Service for the PR
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          TASK_DEF_JSON=$(aws ecs describe-task-definition --task-definition pr-preview-task --query "taskDefinition")
+          NEW_TASK_DEF_JSON=$(echo $TASK_DEF_JSON | jq --arg TAG "$PR_NUMBER" '.containerDefinitions[0].image = "<aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/pr-preview:" + $TAG')
+          echo "$NEW_TASK_DEF_JSON" > new-task-def.json
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --query "taskDefinition.taskDefinitionArn" --output text)
+
+          aws ecs create-service --cluster preview-cluster \
+            --service-name pr-preview-${PR_NUMBER} \
+            --task-definition $NEW_TASK_DEF_ARN \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[subnet-abc123],securityGroups=[sg-xyz456],assignPublicIp=ENABLED}"
+
+      - name: Add Routing in Traefik
+        run: |
+          echo "Creating route for PR-${{ github.event.pull_request.number }}"
+          echo "
+          http:
+            routers:
+              pr-${{ github.event.pull_request.number }}:
+                rule: 'Host(`pr-${{ github.event.pull_request.number }}.example.com`)'
+                service: pr-${{ github.event.pull_request.number }}-service
+          " > /etc/traefik/conf.d/pr-${{ github.event.pull_request.number }}.yml
+          docker restart traefik
+

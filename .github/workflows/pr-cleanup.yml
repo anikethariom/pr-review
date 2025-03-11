@@ -1,0 +1,47 @@
+name: PR Preview Cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Delete ECS Service and Task Definition
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          aws ecs update-service --cluster preview-cluster --service pr-preview-${PR_NUMBER} --desired-count 0
+          aws ecs delete-service --cluster preview-cluster --service pr-preview-${PR_NUMBER} --force
+          aws ecs deregister-task-definition --task-definition pr-preview-task:${PR_NUMBER}
+
+      - name: Delete Docker Image from ECR
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          aws ecr batch-delete-image --repository-name pr-preview --image-ids imageTag=${PR_NUMBER}
+
+      - name: Remove Traefik Routing Rule
+        run: |
+          rm /etc/traefik/conf.d/pr-${{ github.event.pull_request.number }}.yml
+          docker restart traefik
+
+      - name: Send Slack Notification
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          curl -X POST -H 'Content-type: application/json' --data '{
+            "text": "✅ PR Preview Environment for PR #'"$PR_NUMBER"' has been deleted successfully."
+          }' ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Send Discord Notification
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          curl -H "Content-Type: application/json" -X POST -d '{
+            "content": "✅ PR Preview Environment for PR #'"$PR_NUMBER"' has been deleted successfully."
+          }' ${{ secrets.DISCORD_WEBHOOK_URL }}
